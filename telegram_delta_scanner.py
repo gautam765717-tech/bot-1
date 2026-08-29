@@ -249,5 +249,5 @@ def main():
     scan_duration = time.time() - cycle_start_time
     print(f"[+] Single-pass scan completed for {len(current_watchlist)} symbols in {scan_duration:.2f} seconds.")
 
-send_telegram_alert("Delta Scanner Test Alert: Cloud connection is working 100%!")
-main()
+if _name_ == "_main_":
+    main()
