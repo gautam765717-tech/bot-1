@@ -1,7 +1,7 @@
 # ==========================================================
 # FILE: telegram_delta_scanner.py
-# DESCRIPTION: Dynamic Top Multi-Symbol Scanner (1H Trend + 15M Confluence)
-# OPTIMIZED: Parallelized Data Fetching with 8 Workers
+# DESCRIPTION: Delta Exchange Scanner (1H Trend + 15M Confluence)
+# ENVIRONMENT: GitHub Actions Ready (Single-Pass Parallel Execution)
 # ==========================================================
 
 import os
@@ -14,28 +14,21 @@ import numpy as np
 import ccxt
 from concurrent.futures import ThreadPoolExecutor
 
-# Ensure UTF-8 output encoding for terminal printing
+# Ensure UTF-8 output encoding for terminal/runner printing
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 
 # ==========================================================
-# 1. Credentials & Setup
+# 1. Credentials & Exchange Setup
 # ==========================================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8806015211:AAFZ0869Pel2B8Ho5woriygKPI_qUQPgps0")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-1004300378073")
 
-# CCXT Exchange Setup (Public Market Data)
-exchange = ccxt.binance({
-    'enableRateLimit': True,
-    'options': {'defaultType': 'future'}
-})
+# CCXT Exchange Setup (Delta Exchange Public Market Data)
+exchange = ccxt.delta({'enableRateLimit': True})
 
-# Pure Crypto USDT Core Symbols
-CORE_SYMBOLS = [
-    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 
-    'BNB/USDT', 'ADA/USDT', 'DOGE/USDT', 'AVAX/USDT',
-    'LINK/USDT', 'DOT/USDT'
-]
+# Guaranteed 5 Priority Symbols (Always scanned first)
+CORE_SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XAU/USDT', 'XAG/USDT']
 
 # Thread safety lock for shared alert state
 state_lock = threading.Lock()
@@ -61,48 +54,33 @@ def send_telegram_alert(message):
         print(f"Telegram Alert Error: {e}")
 
 
-def get_dynamic_top_10_watchlist():
-    """Fetch live 24h volume from exchange to dynamically build top watchlist of pure Crypto USDT pairs"""
+def get_dynamic_delta_watchlist():
+    """Fetch live 24h volume from Delta Exchange to dynamically build top 50 watchlist"""
     try:
         tickers = exchange.fetch_tickers()
         volume_list = []
         
-        # Exclude non-crypto commodities (gold/silver), equities/stocks, and leverage tokens
-        stock_commodity_bases = {
-            'XAU', 'XAG', 'GOLD', 'SILVER', 'NVDA', 'MSTR', 'TSLA', 'AAPL', 
-            'AMZN', 'GOOG', 'MSFT', 'META', 'MU', 'SOXL', 'SKHYNIX', 'SKHY', 
-            'SPCX', 'KORU', 'SNDK', 'SNXX'
-        }
-        invalid_keywords = ['UP/', 'DOWN/', 'BEAR/', 'BULL/']
-        
         for symbol, data in tickers.items():
-            if '/USDT' in symbol and data.get('quoteVolume') is not None:
+            if data is not None and data.get('quoteVolume') is not None and '/USDT' in symbol:
                 clean_symbol = symbol.split(':')[0].strip()
                 if not clean_symbol or clean_symbol.startswith('/'):
                     continue
                 
-                parts = clean_symbol.split('/')
-                if len(parts) != 2 or not parts[0] or not parts[1]:
-                    continue
-                
-                base_symbol = parts[0].upper()
-                quote_symbol = parts[1].upper()
-                
-                # Base asset must be a valid crypto symbol (ASCII alphanumeric, not identical to quote, at least 2 chars)
-                if not base_symbol.isascii() or base_symbol == quote_symbol or len(base_symbol) < 2 or not base_symbol.isalnum():
-                    continue
-                if base_symbol in stock_commodity_bases:
-                    continue
-                if any(kw in clean_symbol.upper() for kw in invalid_keywords):
-                    continue
+                try:
+                    vol = float(data['quoteVolume'])
+                except (ValueError, TypeError):
+                    vol = 0.0
                 
                 volume_list.append({
                     'symbol': clean_symbol,
-                    'volume': data['quoteVolume']
+                    'volume': vol
                 })
         
-        df_vol = pd.DataFrame(volume_list).drop_duplicates(subset=['symbol']).sort_values(by='volume', ascending=False)
-        top_vol_symbols = df_vol['symbol'].tolist()
+        if volume_list:
+            df_vol = pd.DataFrame(volume_list).drop_duplicates(subset=['symbol']).sort_values(by='volume', ascending=False)
+            top_vol_symbols = df_vol['symbol'].tolist()
+        else:
+            top_vol_symbols = []
         
         final_list = list(CORE_SYMBOLS)
         for sym in top_vol_symbols:
@@ -112,10 +90,10 @@ def get_dynamic_top_10_watchlist():
                 final_list.append(sym)
                 
         safe_list_str = str(final_list).encode('ascii', errors='ignore').decode('ascii')
-        print(f"[+] Updated Top 50 Watchlist ({len(final_list)} pure crypto symbols): {safe_list_str}")
+        print(f"[+] Updated Delta Top 50 Watchlist ({len(final_list)} symbols): {safe_list_str}")
         return final_list
     except Exception as e:
-        print(f"Error updating watchlist: {e}")
+        print(f"Error updating Delta watchlist: {e}")
         return CORE_SYMBOLS
 
 
@@ -128,8 +106,7 @@ def fetch_ohlcv(symbol, timeframe, limit=250):
         df['time'] = pd.to_datetime(df['time'], unit='ms')
         df.set_index('time', inplace=True)
         return df
-    except Exception as e:
-        print(f"Error fetching {symbol} {timeframe}: {e}")
+    except Exception:
         return None
 
 
@@ -260,29 +237,17 @@ def safe_scan_symbol(symbol):
 
 
 def main():
-    print("[+] Starting Parallelized Dynamic Top 50 Scanner Bot (8 Thread Workers)...")
-    current_watchlist = get_dynamic_top_10_watchlist()
-    last_watchlist_update = time.time()
+    print("[+] Starting Delta Exchange Scanner (Single-pass, GitHub Actions Ready)...")
+    cycle_start_time = time.time()
     
-    while True:
-        try:
-            cycle_start_time = time.time()
-            
-            if time.time() - last_watchlist_update > 3600:
-                current_watchlist = get_dynamic_top_10_watchlist()
-                last_watchlist_update = time.time()
-                
-            # Parallelize symbol scanning across 8 worker threads
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                list(executor.map(safe_scan_symbol, current_watchlist))
-                
-            scan_duration = time.time() - cycle_start_time
-            print(f"[+] Completed scanning {len(current_watchlist)} symbols in {scan_duration:.2f} seconds.")
-            
-            time.sleep(30)
-        except Exception as e:
-            print(f"Loop Error: {e}")
-            time.sleep(10)
+    current_watchlist = get_dynamic_delta_watchlist()
+    
+    # Parallelize symbol scanning across 8 worker threads
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(safe_scan_symbol, current_watchlist))
+        
+    scan_duration = time.time() - cycle_start_time
+    print(f"[+] Single-pass scan completed for {len(current_watchlist)} symbols in {scan_duration:.2f} seconds.")
 
 
 if __name__ == "__main__":
