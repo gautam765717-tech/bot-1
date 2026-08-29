@@ -1,0 +1,30 @@
+name: 15M Crypto Confluence Scanner
+
+on:
+  schedule:
+    # Runs automatically every 15 minutes (:00, :15, :30, :45)
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  run-scanner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Scanner
+        run: |
+          python telegram_delta_scanner.py
