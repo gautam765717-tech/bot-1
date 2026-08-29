@@ -249,5 +249,6 @@ def main():
     scan_duration = time.time() - cycle_start_time
     print(f"[+] Single-pass scan completed for {len(current_watchlist)} symbols in {scan_duration:.2f} seconds.")
 
-if _name_ == "_main_":
-    main()
+
+main()
+
