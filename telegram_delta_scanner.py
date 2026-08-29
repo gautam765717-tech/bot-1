@@ -21,8 +21,8 @@ if hasattr(sys.stdout, 'reconfigure'):
 # ==========================================================
 # 1. Credentials & Exchange Setup
 # ==========================================================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8806015211:AAFZ0869Pel2B8Ho5woriygKPI_qUQPgps0")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-1004300378073")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # CCXT Exchange Setup (Delta Exchange Public Market Data)
 exchange = ccxt.delta({'enableRateLimit': True})
