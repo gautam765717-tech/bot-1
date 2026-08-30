@@ -1,7 +1,7 @@
 # ==========================================================
 # FILE: telegram_delta_scanner.py
 # DESCRIPTION: Delta Exchange Scanner (1H Trend + 15M Confluence)
-# ENVIRONMENT: GitHub Actions Ready (Single-Pass Parallel Execution)
+# ENVIRONMENT: GitHub Actions Ready (Wilder RMA + 2-Candle Buffer)
 # ==========================================================
 
 import os
@@ -57,16 +57,13 @@ def send_telegram_alert(message):
 def get_dynamic_delta_watchlist():
     """
     Fetch top 50 active perpetual contracts from Delta Exchange.
-    Guarantees Priority Assets (BTC, ETH, SOL, XRP, Gold, Silver) are ALWAYS included,
-    along with top liquid US Stocks and cryptos.
+    Guarantees Priority Assets (BTC, ETH, SOL, XRP, Gold, Silver) are ALWAYS included.
     """
     watchlist = list(CORE_SYMBOLS)
     try:
-        # 1. Load CCXT Markets to verify supported pair formats
         markets = exchange.load_markets()
         market_symbols = list(markets.keys())
 
-        # 2. Fetch live products from Delta REST API
         url = "https://api.india.delta.exchange/v2/products"
         res = requests.get(url, timeout=10).json()
 
@@ -76,12 +73,10 @@ def get_dynamic_delta_watchlist():
                 c_type = p.get("contract_type", "")
                 state = p.get("state", "")
 
-                # Only live perpetual contracts (Cryptos, Synthetic US Stocks & Commodities)
                 if state == "live" and "perpetual" in c_type:
                     if sym in ["USDCUSDT", "USDC/USDT", "USD_USDT"]:
                         continue
 
-                    # Standardize CCXT symbol notation
                     formatted_sym = None
                     if sym in market_symbols:
                         formatted_sym = sym
@@ -102,7 +97,6 @@ def get_dynamic_delta_watchlist():
                     if formatted_sym not in watchlist:
                         watchlist.append(formatted_sym)
 
-        # टॉप 50 सिम्बल्स तक सीमित करें
         watchlist = watchlist[:50]
         print(f"[+] Loaded {len(watchlist)} total assets (Priority + Cryptos + US Stocks + Commodities).")
         return watchlist
@@ -124,8 +118,14 @@ def fetch_ohlcv(symbol, timeframe, limit=250):
         return None
 
 
+def rma(series, length):
+    """TradingView Wilder's Smoothing (RMA) calculation"""
+    alpha = 1.0 / length
+    return series.ewm(alpha=alpha, min_periods=length, adjust=False).mean()
+
+
 def compute_indicators(df_15m, df_1h):
-    # --- 1H HTF Filters (200 EMA + ADX) ---
+    # --- 1H HTF Filters (200 EMA + TradingView ADX) ---
     df_1h['ema_200'] = df_1h['close'].ewm(span=200, adjust=False).mean()
     
     h_1h, l_1h, c_1h = df_1h['high'], df_1h['low'], df_1h['close']
@@ -134,23 +134,25 @@ def compute_indicators(df_15m, df_1h):
         (h_1h - c_1h.shift(1)).abs(),
         (l_1h - c_1h.shift(1)).abs()
     ], axis=1).max(axis=1)
-    atr_1h = tr_1h.rolling(14).mean()
+    atr_1h = rma(tr_1h, 14)
     
     up_move = h_1h - h_1h.shift(1)
     down_move = l_1h.shift(1) - l_1h
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
     
-    plus_di = 100 * (pd.Series(plus_dm, index=df_1h.index).rolling(14).mean() / (atr_1h + 1e-9))
-    minus_di = 100 * (pd.Series(minus_dm, index=df_1h.index).rolling(14).mean() / (atr_1h + 1e-9))
+    plus_di = 100 * (rma(pd.Series(plus_dm, index=df_1h.index), 14) / (atr_1h + 1e-9))
+    minus_di = 100 * (rma(pd.Series(minus_dm, index=df_1h.index), 14) / (atr_1h + 1e-9))
     dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9))
-    df_1h['adx'] = dx.rolling(14).mean()
+    df_1h['adx'] = rma(dx, 14)
     
-    # --- 15M Execution Indicators ---
+    # --- 15M Execution Indicators (TradingView Wilder RSI) ---
     delta = df_15m['close'].diff()
-    gain = delta.where(delta > 0, 0.0).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
-    rs = gain / (loss + 1e-9)
+    gain = delta.where(delta > 0, 0.0)
+    loss = (-delta.where(delta < 0, 0.0))
+    avg_gain = rma(gain, 14)
+    avg_loss = rma(loss, 14)
+    rs = avg_gain / (avg_loss + 1e-9)
     df_15m['rsi'] = 100 - (100 / (1 + rs))
     
     tr_15 = pd.concat([
@@ -158,7 +160,7 @@ def compute_indicators(df_15m, df_1h):
         (df_15m['high'] - df_15m['close'].shift(1)).abs(),
         (df_15m['low'] - df_15m['close'].shift(1)).abs()
     ], axis=1).max(axis=1)
-    df_15m['atr'] = tr_15.rolling(14).mean()
+    df_15m['atr'] = rma(tr_15, 14)
     df_15m['vol_ma'] = df_15m['volume'].rolling(20).mean()
     
     latest_1h_ema = df_1h['ema_200'].iloc[-1]
@@ -175,75 +177,81 @@ def scan_symbol(symbol):
         return
         
     df_15m, htf_ema, htf_adx = compute_indicators(df_15m, df_1h)
-    closed_candle_time = df_15m.index[-2]
     
-    with state_lock:
-        if last_alerted_candle.get(symbol) == closed_candle_time:
-            return
+    # 2-कैंडल बफर: पिछली 2 क्लोज्ड कैंडल्स चेक करें (डिले होने पर भी मिस न हो)
+    for offset in [-2, -3]:
+        closed_candle_time = df_15m.index[offset]
         
-    c_prev2 = df_15m['close'].iloc[-3]
-    c_prev1 = df_15m['close'].iloc[-2]
-    rsi_prev2 = df_15m['rsi'].iloc[-3]
-    rsi_prev1 = df_15m['rsi'].iloc[-2]
-    vol_prev1 = df_15m['volume'].iloc[-2]
-    vol_ma_prev1 = df_15m['vol_ma'].iloc[-2]
-    atr_val = df_15m['atr'].iloc[-2]
-    
-    # 1. BUY TRIGGER
-    if (c_prev1 > htf_ema) and (htf_adx > 20):
-        if (rsi_prev2 <= 45 and rsi_prev1 > 45) and (vol_prev1 > 1.2 * vol_ma_prev1):
-            sl_dist = 1.5 * atr_val
-            tp_dist = 4.5 * atr_val
-            sl_price = c_prev1 - sl_dist
-            tp_price = c_prev1 + tp_dist
+        with state_lock:
+            if last_alerted_candle.get(symbol) == closed_candle_time:
+                continue
             
-            alert = (
-                f"🟢 *BUY SIGNAL (1:3 RR)*\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"• *Asset*: `{symbol}` (15M)\n"
-                f"• *Entry (Close)*: `{c_prev1:.4f}`\n"
-                f"• *Stop-Loss*: `{sl_price:.4f}` (-{sl_dist:.4f})\n"
-                f"• *Take-Profit*: `{tp_price:.4f}` (+{tp_dist:.4f})\n"
-                f"• *1H Context*: Bullish | ADX: `{htf_adx:.1f}`\n"
-                f"• *Volume*: `{vol_prev1 / (vol_ma_prev1 + 1e-9):.2f}x` 20-MA\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"⚠️ *Check*: Support / Liquidity Sweep Confirmation?\n"
-                f"📌 *Action*: Place Limit Maker Order!"
-            )
-            print(f"[!] BUY Signal sent for {symbol} at {closed_candle_time}")
-            send_telegram_alert(alert)
-            with state_lock:
-                last_alerted_candle[symbol] = closed_candle_time
+        c_prev2 = df_15m['close'].iloc[offset - 1]
+        c_prev1 = df_15m['close'].iloc[offset]
+        rsi_prev2 = df_15m['rsi'].iloc[offset - 1]
+        rsi_prev1 = df_15m['rsi'].iloc[offset]
+        vol_prev1 = df_15m['volume'].iloc[offset]
+        vol_ma_prev1 = df_15m['vol_ma'].iloc[offset]
+        atr_val = df_15m['atr'].iloc[offset]
+        
+        # 1. BUY TRIGGER
+        if (c_prev1 > htf_ema) and (htf_adx > 20):
+            if (rsi_prev2 <= 45 and rsi_prev1 > 45) and (vol_prev1 > 1.2 * vol_ma_prev1):
+                sl_dist = 1.5 * atr_val
+                tp_dist = 4.5 * atr_val
+                sl_price = c_prev1 - sl_dist
+                tp_price = c_prev1 + tp_dist
+                
+                alert = (
+                    f"🟢 *BUY SIGNAL (1:3 RR)*\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"• *Asset*: `{symbol}` (15M)\n"
+                    f"• *Candle Time*: `{closed_candle_time.strftime('%H:%M UTC')}`\n"
+                    f"• *Entry (Close)*: `{c_prev1:.4f}`\n"
+                    f"• *Stop-Loss*: `{sl_price:.4f}` (-{sl_dist:.4f})\n"
+                    f"• *Take-Profit*: `{tp_price:.4f}` (+{tp_dist:.4f})\n"
+                    f"• *1H Context*: Bullish | ADX: `{htf_adx:.1f}`\n"
+                    f"• *Volume*: `{vol_prev1 / (vol_ma_prev1 + 1e-9):.2f}x` 20-MA\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"⚠️ *Check*: Support / Liquidity Sweep Confirmation?\n"
+                    f"📌 *Action*: Place Limit Maker Order!"
+                )
+                print(f"[!] BUY Signal sent for {symbol} at {closed_candle_time}")
+                send_telegram_alert(alert)
+                with state_lock:
+                    last_alerted_candle[symbol] = closed_candle_time
+                break
 
-    # 2. SELL TRIGGER
-    elif (c_prev1 < htf_ema) and (htf_adx > 20):
-        if (rsi_prev2 >= 55 and rsi_prev1 < 55) and (vol_prev1 > 1.2 * vol_ma_prev1):
-            sl_dist = 1.5 * atr_val
-            tp_dist = 4.5 * atr_val
-            sl_price = c_prev1 + sl_dist
-            tp_price = c_prev1 - tp_dist
-            
-            alert = (
-                f"🔴 *SELL SIGNAL (1:3 RR)*\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"• *Asset*: `{symbol}` (15M)\n"
-                f"• *Entry (Close)*: `{c_prev1:.4f}`\n"
-                f"• *Stop-Loss*: `{sl_price:.4f}` (+{sl_dist:.4f})\n"
-                f"• *Take-Profit*: `{tp_price:.4f}` (-{tp_dist:.4f})\n"
-                f"• *1H Context*: Bearish | ADX: `{htf_adx:.1f}`\n"
-                f"• *Volume*: `{vol_prev1 / (vol_ma_prev1 + 1e-9):.2f}x` 20-MA\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"⚠️ *Check*: Resistance / Liquidity Sweep Confirmation?\n"
-                f"📌 *Action*: Place Limit Maker Order!"
-            )
-            print(f"[!] SELL Signal sent for {symbol} at {closed_candle_time}")
-            send_telegram_alert(alert)
-            with state_lock:
-                last_alerted_candle[symbol] = closed_candle_time
+        # 2. SELL TRIGGER
+        elif (c_prev1 < htf_ema) and (htf_adx > 20):
+            if (rsi_prev2 >= 55 and rsi_prev1 < 55) and (vol_prev1 > 1.2 * vol_ma_prev1):
+                sl_dist = 1.5 * atr_val
+                tp_dist = 4.5 * atr_val
+                sl_price = c_prev1 + sl_dist
+                tp_price = c_prev1 - tp_dist
+                
+                alert = (
+                    f"🔴 *SELL SIGNAL (1:3 RR)*\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"• *Asset*: `{symbol}` (15M)\n"
+                    f"• *Candle Time*: `{closed_candle_time.strftime('%H:%M UTC')}`\n"
+                    f"• *Entry (Close)*: `{c_prev1:.4f}`\n"
+                    f"• *Stop-Loss*: `{sl_price:.4f}` (+{sl_dist:.4f})\n"
+                    f"• *Take-Profit*: `{tp_price:.4f}` (-{tp_dist:.4f})\n"
+                    f"• *1H Context*: Bearish | ADX: `{htf_adx:.1f}`\n"
+                    f"• *Volume*: `{vol_prev1 / (vol_ma_prev1 + 1e-9):.2f}x` 20-MA\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"⚠️ *Check*: Resistance / Liquidity Sweep Confirmation?\n"
+                    f"📌 *Action*: Place Limit Maker Order!"
+                )
+                print(f"[!] SELL Signal sent for {symbol} at {closed_candle_time}")
+                send_telegram_alert(alert)
+                with state_lock:
+                    last_alerted_candle[symbol] = closed_candle_time
+                break
 
 
 def safe_scan_symbol(symbol):
-    """Safe wrapper so individual symbol errors do not disrupt parallel execution"""
     try:
         scan_symbol(symbol)
     except Exception as e:
@@ -256,7 +264,6 @@ def main():
     
     current_watchlist = get_dynamic_delta_watchlist()
     
-    # Parallelize symbol scanning across 8 worker threads
     with ThreadPoolExecutor(max_workers=8) as executor:
         list(executor.map(safe_scan_symbol, current_watchlist))
         
