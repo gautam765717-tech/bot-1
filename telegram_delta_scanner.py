@@ -27,8 +27,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # CCXT Exchange Setup (Delta Exchange Public Market Data)
 exchange = ccxt.delta({'enableRateLimit': True})
 
-# Guaranteed 5 Priority Symbols (Always scanned first)
-CORE_SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XAU/USDT', 'XAG/USDT']
+# Guaranteed Priority Symbols (Always scanned first)
+CORE_SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'XAU/USDT', 'XAG/USDT']
 
 # Thread safety lock for shared alert state
 state_lock = threading.Lock()
@@ -36,7 +36,7 @@ last_alerted_candle = {}
 
 
 def send_telegram_alert(message):
-    if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or TELEGRAM_CHAT_ID == "YOUR_CHAT_ID_HERE":
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print(f"[Alert Output (Telegram credentials not set)]:\n{message}\n")
         return
 
@@ -55,45 +55,59 @@ def send_telegram_alert(message):
 
 
 def get_dynamic_delta_watchlist():
-    """Fetch live 24h volume from Delta Exchange to dynamically build top 50 watchlist"""
+    """
+    Fetch top 50 active perpetual contracts from Delta Exchange.
+    Guarantees Priority Assets (BTC, ETH, SOL, XRP, Gold, Silver) are ALWAYS included,
+    along with top liquid US Stocks and cryptos.
+    """
+    watchlist = list(CORE_SYMBOLS)
     try:
-        tickers = exchange.fetch_tickers()
-        volume_list = []
-        
-        for symbol, data in tickers.items():
-            if data is not None and data.get('quoteVolume') is not None and '/USDT' in symbol:
-                clean_symbol = symbol.split(':')[0].strip()
-                if not clean_symbol or clean_symbol.startswith('/'):
-                    continue
-                
-                try:
-                    vol = float(data['quoteVolume'])
-                except (ValueError, TypeError):
-                    vol = 0.0
-                
-                volume_list.append({
-                    'symbol': clean_symbol,
-                    'volume': vol
-                })
-        
-        if volume_list:
-            df_vol = pd.DataFrame(volume_list).drop_duplicates(subset=['symbol']).sort_values(by='volume', ascending=False)
-            top_vol_symbols = df_vol['symbol'].tolist()
-        else:
-            top_vol_symbols = []
-        
-        final_list = list(CORE_SYMBOLS)
-        for sym in top_vol_symbols:
-            if len(final_list) >= 50:
-                break
-            if sym not in final_list:
-                final_list.append(sym)
-                
-        safe_list_str = str(final_list).encode('ascii', errors='ignore').decode('ascii')
-        print(f"[+] Updated Delta Top 50 Watchlist ({len(final_list)} symbols): {safe_list_str}")
-        return final_list
+        # 1. Load CCXT Markets to verify supported pair formats
+        markets = exchange.load_markets()
+        market_symbols = list(markets.keys())
+
+        # 2. Fetch live products from Delta REST API
+        url = "https://api.india.delta.exchange/v2/products"
+        res = requests.get(url, timeout=10).json()
+
+        if res.get("success") and "result" in res:
+            for p in res["result"]:
+                sym = p.get("symbol", "")
+                c_type = p.get("contract_type", "")
+                state = p.get("state", "")
+
+                # Only live perpetual contracts (Cryptos, Synthetic US Stocks & Commodities)
+                if state == "live" and "perpetual" in c_type:
+                    if sym in ["USDCUSDT", "USDC/USDT", "USD_USDT"]:
+                        continue
+
+                    # Standardize CCXT symbol notation
+                    formatted_sym = None
+                    if sym in market_symbols:
+                        formatted_sym = sym
+                    elif "/" not in sym:
+                        if sym.endswith("USDT") and f"{sym[:-4]}/USDT" in market_symbols:
+                            formatted_sym = f"{sym[:-4]}/USDT"
+                        elif sym.endswith("USD") and f"{sym[:-3]}/USD:USD" in market_symbols:
+                            formatted_sym = f"{sym[:-3]}/USD:USD"
+                        elif sym.endswith("USD") and f"{sym[:-3]}/USD" in market_symbols:
+                            formatted_sym = f"{sym[:-3]}/USD"
+
+                    if not formatted_sym:
+                        if "/" not in sym and sym.endswith("USDT"):
+                            formatted_sym = f"{sym[:-4]}/USDT"
+                        else:
+                            formatted_sym = sym
+
+                    if formatted_sym not in watchlist:
+                        watchlist.append(formatted_sym)
+
+        # टॉप 50 सिम्बल्स तक सीमित करें
+        watchlist = watchlist[:50]
+        print(f"[+] Loaded {len(watchlist)} total assets (Priority + Cryptos + US Stocks + Commodities).")
+        return watchlist
     except Exception as e:
-        print(f"Error updating Delta watchlist: {e}")
+        print(f"[-] Error loading dynamic watchlist: {e}. Defaulting to CORE_SYMBOLS.")
         return CORE_SYMBOLS
 
 
@@ -250,5 +264,4 @@ def main():
     print(f"[+] Single-pass scan completed for {len(current_watchlist)} symbols in {scan_duration:.2f} seconds.")
 
 
-main()
-
+main() 
